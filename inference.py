@@ -131,48 +131,33 @@ def load_model(path="recursive_adder.pth"):
     return model
 
 def solve(model, expression):
-    # Parse "123+456"
-    try:
-        a_str, b_str = expression.split('+')
-        a, b = int(a_str), int(b_str)
-    except ValueError:
-        return "Invalid format. Use '123+456'"
-
-    # AUTO-PADDING LOGIC
-    # The model was trained on padding with zeros based on max length.
-    # We infer the 'd' (digits) from the input length to give it the best hint.
+    a_str, b_str = expression.split('+')
+    
+    a_rev = a_str[::-1]
+    b_rev = b_str[::-1]
+    
     max_len = max(len(a_str), len(b_str))
+    a_fwd = a_str.zfill(max_len)
+    b_fwd = b_str.zfill(max_len)
     
-    # Format: "009+012=" (padded to matching lengths)
-    prompt = f"{a:0{max_len}d}+{b:0{max_len}d}="
-    
-    print(f"\nThinking process for '{prompt}':")
+    prompt = f"{a_fwd}+{b_fwd} R {a_fwd[::-1]}+{b_fwd[::-1]} "
     
     idx = torch.tensor([encode(prompt)], dtype=torch.long).to(CONFIG['device'])
     
-    # Generate
+    # 2. Generate
     with torch.no_grad():
-        # Generate enough tokens for the scratchpad
-        generated_idx = model.generate(idx, max_new_tokens=300)
+        generated_idx = model.generate(idx, greedy=True)
         
     output = decode(generated_idx[0].tolist())
+    print(output) # See the thinking!
     
-    # Pretty print the scratchpad
-    # The output looks like: "12+34= 2+4+0=6... 46"
-    # We split strictly by '=' to isolate the prompt from the rest
-    reasoning = output.split('=')[1:] 
-    full_text = output[len(prompt):] # Everything after "="
-    
-    print(full_text)
-    
-    # Extract Answer
-    parts = output.replace('=', ' ').split(' ')
-    candidates = [p for p in parts if p.isdigit()]
-    
-    if candidates:
-        return candidates[-1]
-    else:
-        return "Error: No answer found"
+    try:
+        ans_part = output.split('R ')[-1]
+        import re
+        digits = re.findall(r'\d+', ans_part)[0]
+        return digits[::-1]
+    except:
+        return "Error"
 
 # --- 4. MAIN LOOP ---
 if __name__ == "__main__":
