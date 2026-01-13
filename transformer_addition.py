@@ -32,98 +32,13 @@ CONFIG = {
     'lr': 5e-3,         
     'max_iters': 30000,
     'eval_interval': 500,
-    'max_digits': 3,
+    'max_digits': 10,
     'vocab_size': vocab_size,
     'eval_samples': 50,
     'pad_token_id': PAD_TOKEN_ID,
     'eot_token_id': EOT_TOKEN_ID,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu'
 }
-
-
-
-# def generate_batch(split, batch_size=CONFIG['batch_size']):
-#     X, Y = [], []
-#     for _ in range(batch_size):
-#         # VARIABLE DIFFICULTY:
-#         # Pick a random length between 1 and max_digits for THIS example
-#         d = random.randint(1, CONFIG['max_digits'])
-        
-#         a = random.randint(0, 10**d - 1)
-#         b = random.randint(0, 10**d - 1)
-        
-#         a_str = f"{a:0{d}d}"
-#         b_str = f"{b:0{d}d}"
-        
-#         scratchpad = []
-#         carry = 0
-#         ans_digits = []
-        
-#         # Loop backwards
-#         for i in range(d-1, -1, -1):
-#             da = int(a_str[i])
-#             db = int(b_str[i])
-#             total = da + db + carry
-#             digit_sum = total % 10
-#             new_carry = total // 10
-            
-#             # Format: "9+9+1=19=9 C=1 "
-#             step_str = f"{da}+{db}+{carry}={total}={digit_sum} C={new_carry} "
-#             scratchpad.append(step_str)
-#             ans_digits.append(str(digit_sum))
-#             carry = new_carry
-            
-#         if carry > 0:
-#             ans_digits.append(str(carry))
-            
-#         final_ans = "".join(ans_digits[::-1])
-#         full_reasoning = "".join(scratchpad)
-        
-#         seq_str = f"{a_str}+{b_str}={full_reasoning}{final_ans}"
-        
-#         # Padding
-#         padding = CONFIG['block_size'] - len(seq_str)
-#         if padding < 0: 
-#             # If thinking is too long, crop it (rare with 400 block_size)
-#             seq_str = seq_str[:CONFIG['block_size']]
-#             padding = 0
-#         else:
-#             seq_str += ' ' * padding
-            
-#         data = torch.tensor(encode(seq_str), dtype=torch.long)
-#         X.append(data[:-1])
-#         Y.append(data[1:])
-        
-#     X = torch.stack(X).to(CONFIG['device'])
-#     Y = torch.stack(Y).to(CONFIG['device'])
-#     return X, Y
-
-# def get_accuracy(model, num_samples=100):
-#     model.eval()
-#     correct = 0
-#     with torch.no_grad():
-#         for _ in range(num_samples):
-#             # Test on random lengths too!
-#             d = random.randint(1, CONFIG['max_digits'])
-#             a = random.randint(0, 10**d - 1)
-#             b = random.randint(0, 10**d - 1)
-#             prompt = f"{a:0{d}d}+{b:0{d}d}="
-#             expected = a + b
-            
-#             idx = torch.tensor([encode(prompt)], dtype=torch.long).to(CONFIG['device'])
-#             # Generate enough tokens for 10-digit reasoning
-#             generated_idx = model.generate(idx)
-#             generated_str = decode(generated_idx[0].tolist())
-            
-#             try:
-#                 parts = generated_str.replace('=', ' ').split(' ')
-#                 candidates = [p for p in parts if p.isdigit()]
-#                 if candidates and int(candidates[-1]) == expected:
-#                     correct += 1
-#             except:
-#                 pass
-#     model.train()
-#     return correct / num_samples
 
 
 def estimate_accuracy(model, data, samples=50):
@@ -133,10 +48,6 @@ def estimate_accuracy(model, data, samples=50):
     
     # 1. Pick random samples
     ix = torch.randint(0, data.shape[0], (samples,), device=CONFIG['device'])
-    
-    # 2. Prepare Batches by Prompt Length
-    # We cannot stack "1+1=" (4 chars) and "100+100=" (8 chars) directly.
-    # So we group them!
     prompts_by_len = {}
     
     for i in ix:
@@ -171,7 +82,7 @@ def estimate_accuracy(model, data, samples=50):
             
             # GENERATE IN PARALLEL (The Speedup!)
             # This runs 1 big kernel instead of N small ones
-            gen_tensor = model.generate(prompt_tensor)
+            gen_tensor = model.generate(prompt_tensor, greedy=True)
             
             # 4. Check answers
             for j, seq_idx in enumerate(gen_tensor):
