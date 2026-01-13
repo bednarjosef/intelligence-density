@@ -124,39 +124,66 @@ def estimate_accuracy(model, data, samples=50):
     correct = 0
     total = 0
     
+    # 1. Pick random samples
     ix = torch.randint(0, data.shape[0], (samples,), device=CONFIG['device'])
     
+    # 2. Prepare Batches by Prompt Length
+    # We cannot stack "1+1=" (4 chars) and "100+100=" (8 chars) directly.
+    # So we group them!
+    prompts_by_len = {}
+    
+    for i in ix:
+        full_seq = data[i].tolist()
+        full_str = decode(full_seq)
+        if '=' not in full_str: continue
+        
+        # Parse "123+456="
+        prompt_str = full_str.split('=')[0] + '='
+        
+        # FIX: Split manually to handle leading zeros (e.g., "024")
+        lhs = prompt_str[:-1] # "829+024"
+        num1, num2 = lhs.split('+')
+        expected_val = int(num1) + int(num2)
+        
+        # Group by length of prompt
+        plen = len(prompt_str)
+        if plen not in prompts_by_len:
+            prompts_by_len[plen] = []
+        prompts_by_len[plen].append((prompt_str, expected_val))
+
+    # 3. Process each group as a single BATCH
     with torch.no_grad():
-        for i in ix:
-            full_seq = data[i].tolist()
-            full_str = decode(full_seq)
-            if '=' not in full_str: continue
-            prompt_str = full_str.split('=')[0] + '='
+        for plen, items in prompts_by_len.items():
+            # Create batch tensor
+            batch_prompts = [item[0] for item in items]
+            expected_vals = [item[1] for item in items]
             
-            try:
-                lhs = prompt_str[:-1]
-                expected_val = eval(lhs)
-            except:
-                continue
-
-            prompt_idx = torch.tensor([encode(prompt_str)], dtype=torch.long, device=CONFIG['device'])
-
-            gen_idx = model.generate(prompt_idx)
-            gen_str = decode(gen_idx[0].tolist())
+            # Encode all at once
+            batch_indices = [encode(p) for p in batch_prompts]
+            prompt_tensor = torch.tensor(batch_indices, dtype=torch.long, device=CONFIG['device'])
             
-            try:
-                clean_gen = gen_str.strip()
-                import re
-                numbers = re.findall(r'\d+', clean_gen)
-                if not numbers: continue
+            # GENERATE IN PARALLEL (The Speedup!)
+            # This runs 1 big kernel instead of N small ones
+            gen_tensor = model.generate(prompt_tensor)
+            
+            # 4. Check answers
+            for j, seq_idx in enumerate(gen_tensor):
+                gen_str = decode(seq_idx.tolist())
                 
-                model_ans = int(numbers[-1])
-                
-                if model_ans == expected_val:
-                    correct += 1
-            except:
-                pass
-            total += 1
+                try:
+                    # Parse output
+                    clean_gen = gen_str.strip()
+                    import re
+                    # Find all numbers in the generated string
+                    numbers = re.findall(r'\d+', clean_gen)
+                    if numbers:
+                        # The last number should be the answer
+                        model_ans = int(numbers[-1])
+                        if model_ans == expected_vals[j]:
+                            correct += 1
+                except:
+                    pass
+                total += 1
 
     model.train()
     return correct / total if total > 0 else 0
