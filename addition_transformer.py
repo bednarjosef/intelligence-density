@@ -108,7 +108,13 @@ class RecursiveGPT(nn.Module):
             B, T, C = logits.shape
             logits = logits.view(B*T, C)
             targets = targets.reshape(B*T)
-            loss = F.cross_entropy(logits, targets)
+            
+            loss_elements = F.cross_entropy(logits, targets, reduction='none')
+            mask = (targets != self.CONFIG['pad_token_id']).float()
+            
+            # Apply mask
+            loss = (loss_elements * mask).sum() / mask.sum()
+
         return logits, loss
         
     def generate(self, idx, max_new_tokens=None):

@@ -3,7 +3,9 @@ import random
 import os
 from tqdm import tqdm
 
-max_digits = 3
+from transformer_addition import encode, EOT_TOKEN, PAD_TOKEN
+
+max_digits = 10
 
 DATA_CONFIG = {
     'total_samples': 100_000,
@@ -12,10 +14,6 @@ DATA_CONFIG = {
     'block_size': 200,
     'save_dir': f'datasets/ds_max{max_digits}'
 }
-
-chars = "0123456789+= C" 
-stoi = { ch:i for i,ch in enumerate(chars) }
-encode = lambda s: [stoi[c] for c in s]
 
 def generate_example(max_digits, block_size):
     d = random.randint(1, max_digits)
@@ -45,14 +43,14 @@ def generate_example(max_digits, block_size):
         
     final_ans = "".join(ans_digits[::-1])
     full_reasoning = "".join(scratchpad)
-    seq_str = f"{a_str}+{b_str}={full_reasoning}{final_ans}"
+    seq_str = f"{a_str}+{b_str}={full_reasoning}{final_ans}{EOT_TOKEN}"
     # print(seq_str)
     # print(len(seq_str))
     
     padding = block_size - len(seq_str)
-    if padding < 0: 
+    if padding < 0:
         return None
-    seq_str += ' ' * padding
+    seq_str += PAD_TOKEN * padding
     
     return torch.tensor(encode(seq_str), dtype=torch.uint8) # uint8 saves space!
 
