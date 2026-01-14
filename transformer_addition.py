@@ -1,3 +1,4 @@
+import re
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -7,7 +8,7 @@ import numpy as np
 import time
 import os
 
-from addition_transformer import RecursiveGPT
+from rotary_transformer import RecursiveGPT
 
 EOT_TOKEN = '.'
 PAD_TOKEN = '|'
@@ -25,14 +26,14 @@ PAD_TOKEN_ID = stoi[PAD_TOKEN]
 
 CONFIG = {
     'batch_size': 64,
-    'block_size': 200,
+    'block_size': 256,
     'n_embd': 32,
     'n_head': 4,
     'recursion': 4,
     'lr': 5e-3,         
     'max_iters': 30000,
-    'eval_interval': 2500,
-    'max_digits': 10,
+    'eval_interval': 100,
+    'max_digits': 3,
     'vocab_size': vocab_size,
     'eval_samples': 20,
     'pad_token_id': PAD_TOKEN_ID,
@@ -46,74 +47,64 @@ def estimate_accuracy(model, data, samples=50):
     correct = 0
     total = 0
     
+    # Pick random indices
     ix = torch.randint(0, data.shape[0], (samples,), device=CONFIG['device'])
-    prompts_by_len = {}
     
-    for i in ix:
+    for idx, i in enumerate(ix):
+        # 1. Get the Raw Data String
         full_seq = data[i].tolist()
         full_str = decode(full_seq)
         
-        if ' R ' not in full_str: continue 
+        # Clean up padding/EOT for parsing
+        clean_str = full_str.replace(PAD_TOKEN, '').replace(EOT_TOKEN, '').strip()
         
-        standard_math_part = full_str.split(' R ')[0] 
+        parts = clean_str.split(' ')
+        question_str = parts[0]
         
+        if '+' not in question_str: continue
+
         try:
-            lhs = standard_math_part.strip()
-            num1, num2 = lhs.split('+')
-            expected_val = int(num1) + int(num2)
-            prompt_str = f"{lhs} R {lhs[::-1].replace('+', '+')}" # lazy reconstruction
-
-            import re
-            match = re.search(r' \d+:', full_str)
-            if match:
-                prompt_end = match.start()
-                prompt_str = full_str[:prompt_end+1] # Include the space
-            else:
-                prompt_str = full_str.split(EOT_TOKEN)[0]
-
+            a, b = question_str.split('+')
+            expected_val = int(a) + int(b)
         except:
             continue
+
+        prompt_str = question_str + " R" 
+        prompt_indices = encode(prompt_str)
+        prompt_tensor = torch.tensor(prompt_indices, dtype=torch.long, device=CONFIG['device']).unsqueeze(0)
         
-        # Group by length
-        plen = len(prompt_str)
-        if plen not in prompts_by_len:
-            prompts_by_len[plen] = []
-        prompts_by_len[plen].append((prompt_str, expected_val))
+        max_new = CONFIG['block_size'] - len(prompt_indices)
+        if max_new <= 0: continue
+            
+        gen_indices = model.generate(prompt_tensor, max_new_tokens=max_new, greedy=True)
+        gen_str = decode(gen_indices[0].tolist())
 
-    with torch.no_grad():
-        for plen, items in prompts_by_len.items():
-            batch_prompts = [item[0] for item in items]
-            expected_vals = [item[1] for item in items]
+        if idx < 5:
+            print(f'Prompt: {prompt_str}')
+            print(f'Generated: {gen_str}')
+        
+        if 'R ' in gen_str:
+            last_part = gen_str.split('R ')[-1]
+            last_part = last_part.replace(EOT_TOKEN, '').replace(PAD_TOKEN, '').strip()
             
-            batch_indices = [encode(p) for p in batch_prompts]
-            prompt_tensor = torch.tensor(batch_indices, dtype=torch.long, device=CONFIG['device'])
-            
-            gen_tensor = model.generate(prompt_tensor, greedy=True)
-            
-            for j, seq_idx in enumerate(gen_tensor):
-                gen_str = decode(seq_idx.tolist())
+            try:
+                # Filter for digits only to be safe
+                digits_only = "".join(filter(str.isdigit, last_part))
+                if not digits_only: continue
                 
-                try:
-
-                    if 'R ' in gen_str:
-                        last_r_block = gen_str.split('R ')[-1]
-                        
-                        # Extract digits
-                        numbers = re.findall(r'\d+', last_r_block)
-                        if numbers:
-                            raw_output = numbers[0] 
-                            
-                            model_ans_str = raw_output[::-1]
-                            model_ans = int(model_ans_str)
-                            
-                            if model_ans == expected_vals[j]:
-                                correct += 1
-                except:
-                    pass
-                total += 1
+                # Reverse back to human readable
+                model_ans = int(digits_only[::-1])
+                
+                if model_ans == expected_val:
+                    correct += 1
+            except:
+                pass
+                
+        total += 1
 
     model.train()
     return correct / total if total > 0 else 0
+
 
 def load_data(split, max_digits, device):
     save_dir = f'datasets/ds_max{max_digits}'

@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 from transformer_addition import encode, EOT_TOKEN, PAD_TOKEN
 
-max_digits = 10
+max_digits = 3
 
 DATA_CONFIG = {
     'total_samples': 100_000,
@@ -138,16 +138,20 @@ def generate_example(max_digits, block_size):
     # Final Answer is LSB -> MSB (Reversed) because we appended digits in order
     # Example: 11771 reversed is 17711
     final_ans_rev = "".join(ans_digits)
-    
     full_reasoning = "".join(scratchpad)
     
-    # --- 4. CONSTRUCT FINAL STRING ---
-    # Format: "Input R RevInput Steps R RevAns."
-    # Example: "2837+8934 R 4398+7382 0: ... R 17711."
     seq_str = f"{a_str}+{b_str} R {a_rev}+{b_rev} {full_reasoning}R {final_ans_rev}{EOT_TOKEN}"
+
+    # Padding shift
+    tokens = len(seq_str)
+    free = block_size - tokens
+    if free > 0:
+        shift = random.randint(0, free)
+        seq_str = (PAD_TOKEN * shift) + seq_str
+
     # print(seq_str)
     
-    # --- 5. PADDING ---
+    # Padding at end
     padding = block_size - len(seq_str)
     if padding < 0:
         return None
