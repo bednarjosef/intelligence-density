@@ -6,6 +6,7 @@ from datasets import load_dataset
 import math
 import time
 import sys
+import wandb # <--- ADDED
 
 # -----------------------------------------------------------------------------
 # 1. Configuration
@@ -16,6 +17,7 @@ stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
 
 CONFIG = {
+    'project_name': 'gsm-gpt',
     'n_embd': 288,
     'n_head': 6,
     'block_size': 512,
@@ -29,13 +31,12 @@ CONFIG = {
     'max_iters': 5000,
     'eval_interval': 500,
     
-    # New Configs
-    'val_samples': 1000,   # Reserve first 1000 samples for validation
-    'ignore_index': -100,  # PyTorch default for ignoring targets
+    'val_samples': 1000,
+    'ignore_index': -100,
 }
 
 # -----------------------------------------------------------------------------
-# 2. The Model (With Loss Handling)
+# 2. The Model
 # -----------------------------------------------------------------------------
 class RotaryPositionalEmbeddings(nn.Module):
     def __init__(self, d, base=10000):
@@ -131,16 +132,19 @@ class RecursiveGPT(nn.Module):
             B, T, C = logits.shape
             logits = logits.view(B*T, C)
             targets = targets.reshape(B*T)
-            # PyTorch CrossEntropyLoss handles the ignore_index automatically
             loss = F.cross_entropy(logits, targets, ignore_index=CONFIG['ignore_index'])
             
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens=100):
+    def generate(self, idx, max_new_tokens=100, stream=True):
         self.eval()
-        # Decode the prompt first to show context
-        print(decode(idx[0].tolist()), end='', flush=True) 
+        # Decode the prompt first
+        prompt_str = decode(idx[0].tolist())
+        if stream:
+            print(prompt_str, end='', flush=True) 
+        
+        generated_text = ""
         
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.CONFIG['block_size']:]
@@ -150,16 +154,19 @@ class RecursiveGPT(nn.Module):
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
             
-            # Streaming print with flush=True
             char = itos.get(idx_next.item(), '')
-            print(char, end='', flush=True)
+            generated_text += char
             
-        print() # Newline at end
+            if stream:
+                print(char, end='', flush=True)
+            
+        if stream:
+            print() 
         self.train()
-        return idx
+        return prompt_str + generated_text
 
 # -----------------------------------------------------------------------------
-# 3. Data Pipeline (Streaming, Filtering, Masking, Splitting)
+# 3. Data Pipeline
 # -----------------------------------------------------------------------------
 def encode(s):
     return [stoi.get(c, 0) for c in s]
@@ -167,156 +174,106 @@ def encode(s):
 def decode(l):
     return ''.join([itos.get(i, '') for i in l])
 
-class GSMStreamDataset(IterableDataset):
-    def __init__(self, block_size, mode='train', limit=None):
-        self.block_size = block_size
-        self.mode = mode
-        self.limit = limit
-        # Streaming load
-        self.dataset = load_dataset("nvidia/OpenMathInstruct-2", split="train_1M", streaming=True)
-        
-    def __iter__(self):
-        buffer = []
-        skip_count = CONFIG['val_samples']
-        count = 0
-        
-        for i, sample in enumerate(self.dataset):
-            # FILTER: Source Check
-            if sample['problem_source'] != 'augmented_gsm8k':
-                continue
-            
-            # SPLIT LOGIC:
-            # If train mode: skip the first N samples
-            # If val mode: take ONLY the first N samples
-            if self.mode == 'train':
-                if i < skip_count: continue
-            elif self.mode == 'val':
-                if i >= skip_count: break
-                if self.limit and count >= self.limit: break
-            
-            count += 1
-            
-            # 1. Format Text
-            # We add a clear separator "Solution:" which we will search for later
-            problem_text = f"Problem: {sample['problem']}\n"
-            solution_text = f"Solution: {sample['generated_solution']}\n\n"
-            full_text = problem_text + solution_text
-            
-            # 2. Tokenize
-            tokens = encode(full_text)
-            
-            # 3. Create Masked Targets
-            # Targets are same as input, BUT we set the "Problem" part to -100
-            targets = list(tokens) # Copy
-            
-            # Find index where solution starts
-            # encode("Solution:") length is 9. We find where the problem text ends.
-            sep_len = len(encode(problem_text))
-            
-            # Mask everything up to the solution start
-            # (Set to -100 so CrossEntropy ignores it)
-            for j in range(sep_len):
-                targets[j] = CONFIG['ignore_index']
-                
-            # Add to buffer
-            # We store tuples: (input_token, target_token)
-            for t, tgt in zip(tokens, targets):
-                buffer.append((t, tgt))
-            
-            # Yield chunks
-            while len(buffer) >= self.block_size + 1:
-                chunk = buffer[:self.block_size + 1]
-                buffer = buffer[self.block_size + 1:]
-                
-                # Unzip back into X and Y
-                # X is input (0 to N-1)
-                # Y is target (1 to N) which includes masks
-                
-                chunk_tokens = [x[0] for x in chunk]
-                chunk_targets = [x[1] for x in chunk]
-                
-                x_tensor = torch.tensor(chunk_tokens[:-1], dtype=torch.long)
-                y_tensor = torch.tensor(chunk_targets[1:], dtype=torch.long)
-                
-                yield x_tensor, y_tensor
+print("Loading pre-processed data...")
+train_data = torch.load('train_data.pt')
+val_data = torch.load('val_data.pt')
+print("Data loaded!")
 
-# -----------------------------------------------------------------------------
-# 4. Helpers for Evaluation
-# -----------------------------------------------------------------------------
-@torch.no_grad()
-def evaluate_loss(model):
-    model.eval()
-    loader = DataLoader(GSMStreamDataset(CONFIG['block_size'], mode='val', limit=50), batch_size=CONFIG['batch_size'])
-    losses = []
-    print("Calculating Validation Loss...")
-    for X, Y in loader:
-        X, Y = X.to(CONFIG['device']), Y.to(CONFIG['device'])
-        _, loss = model(X, Y)
-        losses.append(loss.item())
-    model.train()
-    return sum(losses) / len(losses) if len(losses) > 0 else 0.0
+def get_batch(split, block_size, batch_size, device):
+    if split == 'train': data = train_data
+    else: data = val_data
+    inputs = data['inputs']
+    labels = data['labels']
+    
+    ix = torch.randint(len(inputs) - block_size, (batch_size,))
+    
+    x = torch.stack([inputs[i:i+block_size] for i in ix]).to(dtype=torch.long)
+    y = torch.stack([labels[i+1:i+block_size+1] for i in ix]).to(dtype=torch.long)
+    
+    x, y = x.to(device), y.to(device)
+    return x, y
 
 # -----------------------------------------------------------------------------
 # 5. Training Loop
 # -----------------------------------------------------------------------------
 def train():
+    # --- WANDB INIT ---
+    wandb.init(
+        project=CONFIG['project_name'], 
+        name=CONFIG['run_name'], 
+        config=CONFIG
+    )
+    
     print(f"Initializing RecursiveGPT (Widened) ~{sum(p.numel() for p in RecursiveGPT(CONFIG).parameters())/1e6:.1f}M Params")
     model = RecursiveGPT(CONFIG)
     model.to(CONFIG['device'])
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'])
     
-    # Train Loader (Mode='train' skips first 1000)
-    train_dataset = GSMStreamDataset(CONFIG['block_size'], mode='train')
-    train_loader = DataLoader(train_dataset, batch_size=CONFIG['batch_size'])
-    
     model.train()
     iter_num = 0
     t0 = time.time()
     
     print("\nStarting Training Loop...")
-    
-    for X, Y in train_loader:
-        if iter_num >= CONFIG['max_iters']: break
+
+    while iter_num < CONFIG['max_iters']:
+        # 1. Get Batch
+        X, Y = get_batch('train', CONFIG['block_size'], CONFIG['batch_size'], CONFIG['device'])
         
-        X, Y = X.to(CONFIG['device']), Y.to(CONFIG['device'])
-        
-        # Forward
+        # 2. Forward
         logits, loss = model(X, Y)
         
-        # Backward
+        # 3. Backward
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Added gradient clipping for safety
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         
         iter_num += 1
         
-        # Logging
+        # Logging to Console & WandB
         if iter_num % 100 == 0:
             dt = time.time() - t0
             t0 = time.time()
-            print(f"step {iter_num} | train_loss {loss.item():.4f} | time {dt:.2f}s")
+            loss_val = loss.item()
+            print(f"step {iter_num} | train_loss {loss_val:.4f} | time {dt:.2f}s")
+            
+            # --- WANDB LOG TRAIN LOSS ---
+            wandb.log({"train/loss": loss_val, "train/step": iter_num})
             
         # Evaluation
         if iter_num % CONFIG['eval_interval'] == 0:
             print("\n" + "="*50)
             
-            # 1. Validation Loss
-            val_loss = evaluate_loss(model)
+            # Validation Loss
+            losses = []
+            for _ in range(10): 
+                X_val, Y_val = get_batch('val', CONFIG['block_size'], CONFIG['batch_size'], CONFIG['device'])
+                with torch.no_grad():
+                    _, v_loss = model(X_val, Y_val)
+                losses.append(v_loss.item())
+            val_loss = sum(losses) / len(losses)
             print(f"VALIDATION LOSS: {val_loss:.4f}")
             
-            # 2. Visual Sample
+            wandb.log({"val/loss": val_loss, "val/step": iter_num})
+            
             print("\n--- Model Thinking Process ---")
-            # Create a dummy prompt for the model to complete
             test_prompt = "Problem: There are 5 birds on a tree. 3 fly away. How many are left?\nSolution:"
             context = torch.tensor([encode(test_prompt)], dtype=torch.long, device=CONFIG['device'])
             
-            model.generate(context, max_new_tokens=150)
+            full_generation = model.generate(context, max_new_tokens=256, stream=True)
+            
+            sample_table = wandb.Table(columns=["step", "generation"])
+            sample_table.add_data(iter_num, full_generation)
+            wandb.log({"generations": sample_table})
+
             print("="*50 + "\n")
 
     print("Training Complete.")
     torch.save(model.state_dict(), "recursive_gsm_1m.pth")
+    
+    wandb.save("recursive_gsm_1m.pth") 
+    wandb.finish()
 
 if __name__ == '__main__':
     train()
