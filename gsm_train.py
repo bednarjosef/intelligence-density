@@ -20,15 +20,15 @@ CONFIG = {
     'project_name': 'gsm-gpt',
     'n_embd': 288,
     'n_head': 6,
-    'block_size': 512,
+    'block_size': 1024,
     'recursion': 4,
     'vocab_size': vocab_size,
     'dropout': 0.0,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     
-    'batch_size': 64,
+    'batch_size': 1024,
     'lr': 1e-3,
-    'max_iters': 5000,
+    'max_iters': 20000,
     'eval_interval': 500,
     
     'val_samples': 1000,
@@ -200,7 +200,6 @@ def train():
     # --- WANDB INIT ---
     wandb.init(
         project=CONFIG['project_name'], 
-        name=CONFIG['run_name'], 
         config=CONFIG
     )
     
