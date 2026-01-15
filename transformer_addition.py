@@ -27,12 +27,12 @@ PAD_TOKEN_ID = stoi[PAD_TOKEN]
 CONFIG = {
     'batch_size': 64,
     'block_size': 256,
-    'n_embd': 32,
-    'n_head': 4,
+    'n_embd': 448,
+    'n_head': 7,
     'recursion': 4,
     'lr': 5e-3,         
     'max_iters': 30000,
-    'eval_interval': 100,
+    'eval_interval': 2500,
     'max_digits': 3,
     'vocab_size': vocab_size,
     'eval_samples': 20,
@@ -42,63 +42,42 @@ CONFIG = {
 }
 
 
-def estimate_accuracy(model, data, samples=50):
+def estimate_accuracy(model, data, samples=50, verbose=False):
     model.eval()
     correct = 0
     total = 0
     
-    # Pick random indices
     ix = torch.randint(0, data.shape[0], (samples,), device=CONFIG['device'])
     
     for idx, i in enumerate(ix):
-        # 1. Get the Raw Data String
         full_seq = data[i].tolist()
         full_str = decode(full_seq)
         
-        # Clean up padding/EOT for parsing
         clean_str = full_str.replace(PAD_TOKEN, '').replace(EOT_TOKEN, '').strip()
         
         parts = clean_str.split(' ')
-        question_str = parts[0]
-        
-        if '+' not in question_str: continue
 
-        try:
-            a, b = question_str.split('+')
-            expected_val = int(a) + int(b)
-        except:
-            continue
-
-        prompt_str = question_str + " R" 
-        prompt_indices = encode(prompt_str)
-        prompt_tensor = torch.tensor(prompt_indices, dtype=torch.long, device=CONFIG['device']).unsqueeze(0)
+        question = parts[0]
+        answer = parts[-1]
         
-        max_new = CONFIG['block_size'] - len(prompt_indices)
+        question_indices = encode(question)
+        questions_tensor = torch.tensor(question_indices, dtype=torch.long, device=CONFIG['device']).unsqueeze(0)
+        
+        max_new = CONFIG['block_size'] - len(question_indices)
         if max_new <= 0: continue
-            
-        gen_indices = model.generate(prompt_tensor, max_new_tokens=max_new, greedy=True)
-        gen_str = decode(gen_indices[0].tolist())
-
-        if idx < 5:
-            print(f'Prompt: {prompt_str}')
-            print(f'Generated: {gen_str}')
         
-        if 'R ' in gen_str:
-            last_part = gen_str.split('R ')[-1]
-            last_part = last_part.replace(EOT_TOKEN, '').replace(PAD_TOKEN, '').strip()
-            
-            try:
-                # Filter for digits only to be safe
-                digits_only = "".join(filter(str.isdigit, last_part))
-                if not digits_only: continue
-                
-                # Reverse back to human readable
-                model_ans = int(digits_only[::-1])
-                
-                if model_ans == expected_val:
-                    correct += 1
-            except:
-                pass
+        gen_answer_indices = model.generate(questions_tensor, max_new_tokens=max_new, greedy=True)
+        gen_answer = decode(gen_answer_indices[0].tolist())
+
+        if verbose and idx < 5:
+            print(f'Prompt: {question}')
+            print(f'Generated: {gen_answer}')
+
+        clean_gen_answer = gen_answer.replace(PAD_TOKEN, '').replace(EOT_TOKEN, '').strip()
+        gen_result = clean_gen_answer[-1]
+
+        if gen_result == answer:
+            correct += 1
                 
         total += 1
 
@@ -189,7 +168,7 @@ def main():
                 print(f"Step {iter}: Evaluating...", end='\r')
 
                 t_acc = estimate_accuracy(model, train_data, samples=CONFIG['eval_samples'])
-                v_acc = estimate_accuracy(model, val_data, samples=CONFIG['eval_samples'])
+                v_acc = estimate_accuracy(model, val_data, samples=CONFIG['eval_samples'], verbose=True)
 
                 eval_iters.append(iter)
                 train_accs.append(t_acc)

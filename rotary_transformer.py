@@ -134,7 +134,6 @@ class RecursiveGPT(nn.Module):
         if max_new_tokens is None:
             max_new_tokens = self.CONFIG['block_size']
         for _ in range(max_new_tokens):
-            # Important: Crop context to block_size if it gets too long
             idx_cond = idx[:, -self.CONFIG['block_size']:]
             
             logits, _ = self(idx_cond)
