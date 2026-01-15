@@ -20,7 +20,7 @@ CONFIG = {
     'project_name': 'gsm-gpt',
     'n_embd': 288,
     'n_head': 6,
-    'block_size': 1024,
+    'block_size': 512,
     'recursion': 4,
     'vocab_size': vocab_size,
     'dropout': 0.0,
@@ -168,6 +168,9 @@ class RecursiveGPT(nn.Module):
 # -----------------------------------------------------------------------------
 # 3. Data Pipeline
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 3. Data Pipeline (High Performance GPU Loading)
+# -----------------------------------------------------------------------------
 def encode(s):
     return [stoi.get(c, 0) for c in s]
 
@@ -175,22 +178,36 @@ def decode(l):
     return ''.join([itos.get(i, '') for i in l])
 
 print("Loading pre-processed data...")
-train_data = torch.load('train_data.pt')
-val_data = torch.load('val_data.pt')
-print("Data loaded!")
+# 1. Load to CPU first
+data_train_cpu = torch.load('train_data.pt')
+data_val_cpu = torch.load('val_data.pt')
 
-def get_batch(split, block_size, batch_size, device):
-    if split == 'train': data = train_data
-    else: data = val_data
-    inputs = data['inputs']
-    labels = data['labels']
+# 2. Move EVERYTHING to GPU immediately
+# We cast to long (int64) now so we don't have to do it every step
+print(f"Moving dataset to {CONFIG['device']}... (This makes batching instant)")
+
+train_inputs = data_train_cpu['inputs'].to(CONFIG['device'], dtype=torch.long)
+train_labels = data_train_cpu['labels'].to(CONFIG['device'], dtype=torch.long)
+
+val_inputs = data_val_cpu['inputs'].to(CONFIG['device'], dtype=torch.long)
+val_labels = data_val_cpu['labels'].to(CONFIG['device'], dtype=torch.long)
+
+print("Data loaded and locked in VRAM!")
+
+def get_batch(split, block_size, batch_size):
+    if split == 'train':
+        inputs, labels = train_inputs, train_labels
+    else:
+        inputs, labels = val_inputs, val_labels
     
-    ix = torch.randint(len(inputs) - block_size, (batch_size,))
+    ix = torch.randint(len(inputs) - block_size, (batch_size,), device=CONFIG['device'])
+    offsets = torch.arange(block_size, device=CONFIG['device'])
     
-    x = torch.stack([inputs[i:i+block_size] for i in ix]).to(dtype=torch.long)
-    y = torch.stack([labels[i+1:i+block_size+1] for i in ix]).to(dtype=torch.long)
+    idx_matrix = ix.unsqueeze(1) + offsets
     
-    x, y = x.to(device), y.to(device)
+    x = inputs[idx_matrix]
+    y = labels[idx_matrix + 1]
+    
     return x, y
 
 # -----------------------------------------------------------------------------
@@ -217,7 +234,7 @@ def train():
 
     while iter_num < CONFIG['max_iters']:
         # 1. Get Batch
-        X, Y = get_batch('train', CONFIG['block_size'], CONFIG['batch_size'], CONFIG['device'])
+        X, Y = get_batch('train', CONFIG['block_size'], CONFIG['batch_size'])
         
         # 2. Forward
         logits, loss = model(X, Y)
