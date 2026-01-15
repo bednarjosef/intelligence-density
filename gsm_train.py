@@ -19,7 +19,7 @@ itos = { i:ch for i,ch in enumerate(chars) }
 CONFIG = {
     'project_name': 'gsm-gpt',
     'n_embd': 288,
-    'n_head': 6,
+    'n_head': 12,
     'block_size': 512,
     'recursion': 4,
     'vocab_size': vocab_size,
@@ -277,7 +277,7 @@ def train():
             test_prompt = "Problem: There are 5 birds on a tree. 3 fly away. How many are left?\nSolution:"
             context = torch.tensor([encode(test_prompt)], dtype=torch.long, device=CONFIG['device'])
             
-            full_generation = model.generate(context, max_new_tokens=256, stream=True)
+            full_generation = model.generate(context, max_new_tokens=(CONFIG['block_size']-len(context)), stream=True)
             
             sample_table = wandb.Table(columns=["step", "generation"])
             sample_table.add_data(iter_num, full_generation)
