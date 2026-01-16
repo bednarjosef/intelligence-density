@@ -116,22 +116,47 @@ class RecursiveGPT(nn.Module):
         self.shared_block = Block(CONFIG)
         self.ln_f = nn.LayerNorm(CONFIG['n_embd'], bias=False)
         self.lm_head = nn.Linear(CONFIG['n_embd'], CONFIG['vocab_size'], bias=False)
+        
+        # Tie weights
         self.token_embedding_table.weight = self.lm_head.weight 
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
-        x = self.token_embedding_table(idx)
-        for _ in range(self.CONFIG['recursion']):
+        
+        input_embeds = self.token_embedding_table(idx)
+        x = input_embeds
+        
+        all_logits = []
+        
+        for step in range(self.CONFIG['recursion']):
+            if step > 0:
+                x = x + input_embeds 
+            
             x = self.shared_block(x)
+            if targets is not None:
+                current_logits = self.lm_head(self.ln_f(x))
+                all_logits.append(current_logits)
+
         x = self.ln_f(x)
         logits = self.lm_head(x)
         
         loss = None
         if targets is not None:
             B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.reshape(B*T)
-            loss = F.cross_entropy(logits, targets, ignore_index=CONFIG['ignore_index'])
+            
+            # Reshape targets
+            flat_targets = targets.reshape(B*T)
+            
+            # Calculate "Deep Supervision" Loss
+            # Loss = Average of loss at Step 1, Step 2, ... Step 8
+            total_loss = 0
+            for step_logits in all_logits:
+                step_logits = step_logits.view(B*T, C)
+                step_loss = F.cross_entropy(step_logits, flat_targets, ignore_index=CONFIG['ignore_index'])
+                total_loss += step_loss
+            
+            # Average the loss over all steps
+            loss = total_loss / len(all_logits)
             
         return logits, loss
 
