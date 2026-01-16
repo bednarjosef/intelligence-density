@@ -1,12 +1,10 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-from torch.utils.data import IterableDataset, DataLoader
-from datasets import load_dataset
 import math
 import time
-import sys
-import wandb # <--- ADDED
+import wandb 
+import re
 
 # -----------------------------------------------------------------------------
 # 1. Configuration
@@ -16,22 +14,23 @@ vocab_size = len(chars)
 stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
 
+# EOT Token ID (The tilde '~')
+EOS_TOKEN_ID = stoi['~']
+
 CONFIG = {
     'project_name': 'gsm-gpt',
     'n_embd': 288,
     'n_head': 12,
-    'block_size': 512,
-    'recursion': 4,
+    'block_size': 1024,
+    'recursion': 8,
     'vocab_size': vocab_size,
     'dropout': 0.0,
     'device': 'cuda' if torch.cuda.is_available() else 'cpu',
     
-    'batch_size': 1024,
-    'lr': 1e-3,
+    'batch_size': 48,
+    'lr': 3e-4,
     'max_iters': 20000,
     'eval_interval': 500,
-    
-    'val_samples': 1000,
     'ignore_index': -100,
 }
 
@@ -139,7 +138,6 @@ class RecursiveGPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens=100, stream=True):
         self.eval()
-        # Decode the prompt first
         prompt_str = decode(idx[0].tolist())
         if stream:
             print(prompt_str, end='', flush=True) 
@@ -152,6 +150,11 @@ class RecursiveGPT(nn.Module):
             logits = logits[:, -1, :]
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
+            
+            # --- STOP GENERATION IF EOS TOKEN IS PRODUCED ---
+            if idx_next.item() == EOS_TOKEN_ID:
+                break
+            
             idx = torch.cat((idx, idx_next), dim=1)
             
             char = itos.get(idx_next.item(), '')
@@ -166,9 +169,6 @@ class RecursiveGPT(nn.Module):
         return prompt_str + generated_text
 
 # -----------------------------------------------------------------------------
-# 3. Data Pipeline
-# -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
 # 3. Data Pipeline (High Performance GPU Loading)
 # -----------------------------------------------------------------------------
 def encode(s):
@@ -177,36 +177,37 @@ def encode(s):
 def decode(l):
     return ''.join([itos.get(i, '') for i in l])
 
-print("Loading pre-processed data...")
-# 1. Load to CPU first
-data_train_cpu = torch.load('train_data.pt')
-data_val_cpu = torch.load('val_data.pt')
+print("Loading compressed data...")
+try:
+    data_train = torch.load('train_data_uint8.pt')
+    data_val = torch.load('val_data_uint8.pt')
+except FileNotFoundError:
+    print("Error: Data files not found. Please run prepare_data.py first.")
+    exit()
 
-# 2. Move EVERYTHING to GPU immediately
-# We cast to long (int64) now so we don't have to do it every step
-print(f"Moving dataset to {CONFIG['device']}... (This makes batching instant)")
-
-train_inputs = data_train_cpu['inputs'].to(CONFIG['device'], dtype=torch.long)
-train_labels = data_train_cpu['labels'].to(CONFIG['device'], dtype=torch.long)
-
-val_inputs = data_val_cpu['inputs'].to(CONFIG['device'], dtype=torch.long)
-val_labels = data_val_cpu['labels'].to(CONFIG['device'], dtype=torch.long)
-
-print("Data loaded and locked in VRAM!")
+print(f"Moving dataset to {CONFIG['device']}...")
+train_inputs = data_train['inputs'].to(CONFIG['device']) 
+train_labels = data_train['labels'].to(CONFIG['device'])
+val_inputs = data_val['inputs'].to(CONFIG['device'])
+val_labels = data_val['labels'].to(CONFIG['device'])
+print("Data loaded!")
 
 def get_batch(split, block_size, batch_size):
-    if split == 'train':
-        inputs, labels = train_inputs, train_labels
-    else:
-        inputs, labels = val_inputs, val_labels
+    if split == 'train': inputs, labels = train_inputs, train_labels
+    else: inputs, labels = val_inputs, val_labels
     
     ix = torch.randint(len(inputs) - block_size, (batch_size,), device=CONFIG['device'])
     offsets = torch.arange(block_size, device=CONFIG['device'])
-    
     idx_matrix = ix.unsqueeze(1) + offsets
     
     x = inputs[idx_matrix]
     y = labels[idx_matrix + 1]
+    
+    x = x.to(dtype=torch.long)
+    y = y.to(dtype=torch.long)
+    
+    # 100 was our masking value in prepare_data, mapping it back to -100 for PyTorch
+    y[y == 100] = -100 
     
     return x, y
 
@@ -214,7 +215,6 @@ def get_batch(split, block_size, batch_size):
 # 5. Training Loop
 # -----------------------------------------------------------------------------
 def train():
-    # --- WANDB INIT ---
     wandb.init(
         project=CONFIG['project_name'], 
         config=CONFIG
@@ -223,6 +223,10 @@ def train():
     print(f"Initializing RecursiveGPT (Widened) ~{sum(p.numel() for p in RecursiveGPT(CONFIG).parameters())/1e6:.1f}M Params")
     model = RecursiveGPT(CONFIG)
     model.to(CONFIG['device'])
+
+    print("Compiling model...")
+    model = torch.compile(model)
+    torch.set_float32_matmul_precision('high')
     
     optimizer = torch.optim.AdamW(model.parameters(), lr=CONFIG['lr'])
     
@@ -233,13 +237,10 @@ def train():
     print("\nStarting Training Loop...")
 
     while iter_num < CONFIG['max_iters']:
-        # 1. Get Batch
         X, Y = get_batch('train', CONFIG['block_size'], CONFIG['batch_size'])
         
-        # 2. Forward
         logits, loss = model(X, Y)
         
-        # 3. Backward
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -252,19 +253,28 @@ def train():
             dt = time.time() - t0
             t0 = time.time()
             loss_val = loss.item()
+            
+            # --- CALCULATE METRICS ---
+            tokens_seen = iter_num * CONFIG['batch_size'] * CONFIG['block_size']
+            examples_seen = iter_num * CONFIG['batch_size']
+            
             print(f"step {iter_num} | train_loss {loss_val:.4f} | time {dt:.2f}s")
             
-            # --- WANDB LOG TRAIN LOSS ---
-            wandb.log({"train/loss": loss_val, "train/step": iter_num})
+            # --- LOG DETAILED METRICS ---
+            wandb.log({
+                "train/loss": loss_val, 
+                "train/step": iter_num,
+                "train/tokens_seen": tokens_seen,
+                "train/examples_seen": examples_seen
+            })
             
         # Evaluation
         if iter_num % CONFIG['eval_interval'] == 0:
             print("\n" + "="*50)
             
-            # Validation Loss
             losses = []
             for _ in range(10): 
-                X_val, Y_val = get_batch('val', CONFIG['block_size'], CONFIG['batch_size'], CONFIG['device'])
+                X_val, Y_val = get_batch('val', CONFIG['block_size'], CONFIG['batch_size'])
                 with torch.no_grad():
                     _, v_loss = model(X_val, Y_val)
                 losses.append(v_loss.item())
@@ -277,7 +287,8 @@ def train():
             test_prompt = "Problem: There are 5 birds on a tree. 3 fly away. How many are left?\nSolution:"
             context = torch.tensor([encode(test_prompt)], dtype=torch.long, device=CONFIG['device'])
             
-            full_generation = model.generate(context, max_new_tokens=(CONFIG['block_size']-len(context)), stream=True)
+            # Use max_new_tokens to prevent infinite generation, but model should stop early on '~'
+            full_generation = model.generate(context, max_new_tokens=512, stream=True)
             
             sample_table = wandb.Table(columns=["step", "generation"])
             sample_table.add_data(iter_num, full_generation)
@@ -287,7 +298,6 @@ def train():
 
     print("Training Complete.")
     torch.save(model.state_dict(), "recursive_gsm_1m.pth")
-    
     wandb.save("recursive_gsm_1m.pth") 
     wandb.finish()
 
